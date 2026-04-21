@@ -1,0 +1,75 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Oracle.PrivateFeed where
+
+import DA.Time (Time)
+
+-- | Represents a financial asset pair, e.g., ETH/USD.
+-- Using a dedicated data type improves clarity and type safety.
+data AssetPair = AssetPair
+  with
+    baseAsset  : Text
+    quoteAsset : Text
+  deriving (Eq, Show, Ord)
+
+-- | Represents a single price point observation at a specific time.
+data PriceData = PriceData
+  with
+    price     : Decimal -- ^ The observed price, with up to 10 decimal places of precision.
+    timestamp : Time    -- ^ The UTC timestamp of the price observation.
+  deriving (Eq, Show, Ord)
+
+-- | A private price feed contract between an oracle operator and a single dApp subscriber.
+-- The core privacy feature is that the price data on this contract is only visible to the
+-- `operator` and the `subscriber`. This prevents front-running and information leakage, as
+-- other participants on the network cannot see the price updates. The subscriber's dApp
+-- can use this contract as a trusted, private price source for its own internal logic, such
+-- as calculating collateral requirements or executing a trade.
+template PrivatePriceFeed
+  with
+    operator    : Party            -- ^ The party operating the oracle service.
+    subscriber  : Party            -- ^ The party (dApp) subscribed to this price feed.
+    assetPair   : AssetPair        -- ^ The asset pair for which the price is provided.
+    lastPrice   : Optional PriceData -- ^ The most recent price update. `None` before the first update.
+    description : Text             -- ^ A human-readable description of the feed (e.g., "ETH/USD Price Feed").
+  where
+    signatory operator, subscriber
+
+    key (operator, subscriber, assetPair) : (Party, Party, AssetPair)
+    maintainer key._1
+
+    -- | Allows the subscriber to query the latest price data from the feed.
+    -- This is a non-consuming choice, meaning it reads the contract state without changing it.
+    -- It is the primary method for a dApp to retrieve the current price.
+    nonconsuming choice GetPrice : Optional PriceData
+      controller subscriber, operator
+      do
+        return lastPrice
+
+    -- | Allows the oracle operator to push a new price update to the feed.
+    -- This archives the current feed contract and creates a new one with the updated price,
+    -- following the standard Daml update pattern. The choice ensures that new price updates
+    -- have a timestamp that is strictly later than the previous one, preventing out-of-order
+    -- or stale data submissions.
+    choice UpdatePrice : ContractId PrivatePriceFeed
+      with
+        newPriceData : PriceData
+      controller operator
+      do
+        assertMsg "New price timestamp must be after the last known timestamp" $
+          case lastPrice of
+            None -> True
+            Some oldPrice -> newPriceData.timestamp > oldPrice.timestamp
+
+        assertMsg "Price must be positive" $ newPriceData.price > 0.0
+
+        create this with lastPrice = Some newPriceData
+
+    -- | Allows the subscriber to terminate their subscription to the price feed.
+    -- This action archives the contract, effectively ending the service for this subscriber.
+    -- The operator does not need to consent, giving the subscriber control over their subscription.
+    choice Unsubscribe : ()
+      controller subscriber
+      do
+        return ()
