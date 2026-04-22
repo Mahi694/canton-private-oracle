@@ -1,75 +1,109 @@
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
+-- |
+-- Copyright (c) 2024, Digital Asset (Switzerland) GmbH and/or its affiliates.
+-- All rights reserved.
+--
 
 module Oracle.PrivateFeed where
 
-import DA.Time (Time)
+import DA.Time (Time, addRelTime, seconds)
+import DA.List (length, elem, notElem, filter)
+import DA.Action (forA_, mapA)
+import DA.Assert ((assertMsg))
+import DA.Next.Map as Map
 
--- | Represents a financial asset pair, e.g., ETH/USD.
--- Using a dedicated data type improves clarity and type safety.
-data AssetPair = AssetPair
-  with
-    baseAsset  : Text
-    quoteAsset : Text
-  deriving (Eq, Show, Ord)
+import Oracle.TrimmedMedian as TrimmedMedian
+import Oracle.ProviderSubmission (ProviderSubmission(..))
 
--- | Represents a single price point observation at a specific time.
-data PriceData = PriceData
+-- | Represents the aggregated, private price feed for a specific asset pair.
+-- This contract is the core of the oracle, holding the latest price data.
+-- It is only visible to the aggregator and its subscribers, ensuring privacy.
+-- The feed has a Time-To-Live (TTL) mechanism to allow for the archiving
+-- of stale data.
+template PrivateFeed
   with
-    price     : Decimal -- ^ The observed price, with up to 10 decimal places of precision.
-    timestamp : Time    -- ^ The UTC timestamp of the price observation.
-  deriving (Eq, Show, Ord)
-
--- | A private price feed contract between an oracle operator and a single dApp subscriber.
--- The core privacy feature is that the price data on this contract is only visible to the
--- `operator` and the `subscriber`. This prevents front-running and information leakage, as
--- other participants on the network cannot see the price updates. The subscriber's dApp
--- can use this contract as a trusted, private price source for its own internal logic, such
--- as calculating collateral requirements or executing a trade.
-template PrivatePriceFeed
-  with
-    operator    : Party            -- ^ The party operating the oracle service.
-    subscriber  : Party            -- ^ The party (dApp) subscribed to this price feed.
-    assetPair   : AssetPair        -- ^ The asset pair for which the price is provided.
-    lastPrice   : Optional PriceData -- ^ The most recent price update. `None` before the first update.
-    description : Text             -- ^ A human-readable description of the feed (e.g., "ETH/USD Price Feed").
+    aggregator: Party
+      -- ^ The party responsible for aggregating prices and updating the feed.
+    subscribers: [Party]
+      -- ^ The list of parties who have subscribed to this price feed.
+    assetPair: Text
+      -- ^ The identifier for the asset pair, e.g., "ETH/USD".
+    price: Decimal
+      -- ^ The current aggregated price for the asset pair.
+    lastUpdatedAt: Time
+      -- ^ The UTC timestamp of the last successful price update.
+    maxAgeSeconds: Int
+      -- ^ The maximum age of the feed in seconds before it's considered stale.
   where
-    signatory operator, subscriber
+    signatory aggregator
+    observer subscribers
 
-    key (operator, subscriber, assetPair) : (Party, Party, AssetPair)
+    key (aggregator, assetPair) : (Party, Text)
     maintainer key._1
 
-    -- | Allows the subscriber to query the latest price data from the feed.
-    -- This is a non-consuming choice, meaning it reads the contract state without changing it.
-    -- It is the primary method for a dApp to retrieve the current price.
-    nonconsuming choice GetPrice : Optional PriceData
-      controller subscriber, operator
-      do
-        return lastPrice
-
-    -- | Allows the oracle operator to push a new price update to the feed.
-    -- This archives the current feed contract and creates a new one with the updated price,
-    -- following the standard Daml update pattern. The choice ensures that new price updates
-    -- have a timestamp that is strictly later than the previous one, preventing out-of-order
-    -- or stale data submissions.
-    choice UpdatePrice : ContractId PrivatePriceFeed
+    -- | Updates the price feed by aggregating new provider submissions.
+    -- This choice fetches a set of `ProviderSubmission` contracts, calculates a
+    -- trimmed median to get a robust price, archives the submissions, and
+    -- creates a new `PrivateFeed` contract with the updated data.
+    choice Update : ContractId PrivateFeed
       with
-        newPriceData : PriceData
-      controller operator
+        submissionCids: [ContractId ProviderSubmission]
+          -- ^ A list of contract IDs for the provider submissions to be aggregated.
+        newTime: Time
+          -- ^ The timestamp for this update, typically provided by `getTime`.
+      controller aggregator
       do
-        assertMsg "New price timestamp must be after the last known timestamp" $
-          case lastPrice of
-            None -> True
-            Some oldPrice -> newPriceData.timestamp > oldPrice.timestamp
+        -- Ensure there is a minimum number of submissions to prevent manipulation.
+        let minSubmissions = 3
+        assertMsg ("At least " <> show minSubmissions <> " submissions are required for an update.") (length submissionCids >= minSubmissions)
 
-        assertMsg "Price must be positive" $ newPriceData.price > 0.0
+        -- Fetch all submission contracts and their data.
+        submissions <- mapA fetch submissionCids
+        let prices = map (\s -> s.price) submissions
 
-        create this with lastPrice = Some newPriceData
+        -- Verify that all submissions are for the correct asset pair.
+        forA_ submissions \s ->
+          assertMsg ("Submission for wrong asset pair. Expected " <> assetPair <> ", got " <> s.assetPair) (s.assetPair == assetPair)
 
-    -- | Allows the subscriber to terminate their subscription to the price feed.
-    -- This action archives the contract, effectively ending the service for this subscriber.
-    -- The operator does not need to consent, giving the subscriber control over their subscription.
-    choice Unsubscribe : ()
-      controller subscriber
+        -- Calculate the new price using a trimmed median to filter outliers.
+        let newPrice = TrimmedMedian.calculate prices
+
+        -- Archive the used submissions.
+        forA_ submissionCids \cid ->
+          exercise cid ProviderSubmission.Archive
+
+        -- Create the updated feed contract.
+        create this with
+          price = newPrice,
+          lastUpdatedAt = newTime
+
+    -- | Archives the feed if it has become stale (i.e., not updated within
+    -- `maxAgeSeconds`). This is a garbage collection mechanism to keep the
+    -- Active Contract Set (ACS) clean. It can be exercised by the aggregator or
+    -- any subscriber.
+    choice ArchiveStaleFeed : ()
+      with
+        currentTime: Time
+          -- ^ The current time, used to check against the feed's last update time.
+      controller (aggregator :: subscribers)
       do
+        let expiryTime = addRelTime (seconds (fromIntegral maxAgeSeconds)) lastUpdatedAt
+        assertMsg ("Feed is not stale yet. Can be archived after " <> show expiryTime) (currentTime > expiryTime)
         return ()
+
+    -- | Allows the aggregator to add a new party to the list of subscribers.
+    choice AddSubscriber : ContractId PrivateFeed
+      with
+        newSubscriber : Party
+      controller aggregator
+      do
+        assertMsg "Party is already a subscriber." (notElem newSubscriber subscribers)
+        create this with subscribers = newSubscriber :: subscribers
+
+    -- | Allows the aggregator to remove a party from the list of subscribers.
+    choice RemoveSubscriber : ContractId PrivateFeed
+      with
+        subscriberToRemove : Party
+      controller aggregator
+      do
+        assertMsg "Party is not a subscriber." (elem subscriberToRemove subscribers)
+        create this with subscribers = filter (\p -> p /= subscriberToRemove) subscribers
