@@ -1,0 +1,240 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module OracleTest where
+
+import Daml.Script
+import Oracle.PrivateFeed
+import Oracle.ProviderSubmission
+import Oracle.Subscription
+import Oracle.ProviderStake
+import DA.Date as Date
+import DA.Time
+import DA.Assert
+import DA.Action (when)
+
+-- === Constants ===
+
+ethUsdPair : Text = "ETH/USD"
+minSubmissions : Int = 3
+maxSubmissions : Int = 10
+submissionTtl : RelTime = minutes 5
+stakeRequirement : Decimal = 1000.0
+
+-- === Test Setup ===
+
+-- A record to hold all the parties and common contract IDs for a test scenario.
+data TestSetup = TestSetup
+  with
+    aggregator: Party
+    subscriber: Party
+    p1: Party
+    p2: Party
+    p3: Party
+    p4: Party
+    p5: Party
+    feedCid: ContractId PrivateFeed
+    now: Time
+
+setup : Script TestSetup
+setup = do
+  aggregator <- allocatePartyWithHint "Aggregator" (PartyIdHint "aggregator")
+  subscriber <- allocatePartyWithHint "Subscriber" (PartyIdHint "subscriber")
+  p1 <- allocatePartyWithHint "Provider1" (PartyIdHint "provider1")
+  p2 <- allocatePartyWithHint "Provider2" (PartyIdHint "provider2")
+  p3 <- allocatePartyWithHint "Provider3" (PartyIdHint "provider3")
+  p4 <- allocatePartyWithHint "Provider4" (PartyIdHint "provider4")
+  p5 <- allocatePartyWithHint "Provider5" (PartyIdHint "provider5")
+
+  now <- getTime
+
+  feedCid <- submit aggregator do
+    createCmd PrivateFeed with
+      aggregator
+      subscribers = []
+      pair = ethUsdPair
+      minSubmissions
+      maxSubmissions
+      submissionTtl
+      stakeRequirement
+      lastPrice = None
+      lastUpdatedAt = now
+
+  let providers = [p1, p2, p3, p4, p5]
+  forA_ providers \p ->
+    submit p do
+      createCmd ProviderStake with
+        provider = p
+        aggregator
+        stakeAmount = stakeRequirement
+        feedPair = ethUsdPair
+
+  return TestSetup with ..
+
+-- === Test Cases ===
+
+testOracleSuite : Script ()
+testOracleSuite = script do
+  testHappyPathAggregation
+  testOutlierRejection
+  testInsufficientSubmissions
+  testSubmissionExpiry
+  testSubscriptionWorkflow
+  testUnstakedProvider
+
+testHappyPathAggregation : Script ()
+testHappyPathAggregation = script do
+  -- Test that with 5 valid submissions, the feed is updated with the trimmed median.
+  -- Submissions: 100.0, 101.0, 102.0, 103.0, 104.0
+  -- Trimmed (remove 100.0, 104.0): [101.0, 102.0, 103.0]
+  -- Median: 102.0
+  debug "Running test: testHappyPathAggregation"
+  s <- setup
+
+  let prices = [100.0, 101.0, 102.0, 103.0, 104.0]
+  let providers = [s.p1, s.p2, s.p3, s.p4, s.p5]
+
+  forA_ (zip providers prices) \(p, price) ->
+    submit p do
+      exerciseCmd s.feedCid SubmitPrice with price
+
+  passTime (seconds 1)
+  updateTime <- getTime
+
+  (updatedFeedCid, _) <- submit s.aggregator do
+    exerciseCmd s.feedCid UpdateFeed
+
+  Some updatedFeed <- queryContractId s.aggregator updatedFeedCid
+  updatedFeed.lastPrice === Some 102.0
+  updatedFeed.lastUpdatedAt === updateTime
+  debug "Success: testHappyPathAggregation"
+
+testOutlierRejection : Script ()
+testOutlierRejection = script do
+  -- Test that extreme outliers are correctly trimmed from the calculation.
+  -- Submissions: 10.0, 99.0, 100.0, 101.0, 200.0
+  -- Trimmed (remove 10.0, 200.0): [99.0, 100.0, 101.0]
+  -- Median: 100.0
+  debug "Running test: testOutlierRejection"
+  s <- setup
+
+  let prices = [10.0, 99.0, 100.0, 101.0, 200.0]
+  let providers = [s.p1, s.p2, s.p3, s.p4, s.p5]
+
+  forA_ (zip providers prices) \(p, price) ->
+    submit p do
+      exerciseCmd s.feedCid SubmitPrice with price
+
+  passTime (seconds 1)
+  updateTime <- getTime
+
+  (updatedFeedCid, _) <- submit s.aggregator do
+    exerciseCmd s.feedCid UpdateFeed
+
+  Some updatedFeed <- queryContractId s.aggregator updatedFeedCid
+  updatedFeed.lastPrice === Some 100.0
+  updatedFeed.lastUpdatedAt === updateTime
+  debug "Success: testOutlierRejection"
+
+testInsufficientSubmissions : Script ()
+testInsufficientSubmissions = script do
+  -- Test that the feed is not updated if fewer than `minSubmissions` are provided.
+  debug "Running test: testInsufficientSubmissions"
+  s <- setup
+
+  -- Submit only 2 prices, while minSubmissions is 3
+  submit s.p1 do exerciseCmd s.feedCid SubmitPrice with price = 100.0
+  submit s.p2 do exerciseCmd s.feedCid SubmitPrice with price = 101.0
+
+  -- This should not fail, but it should not update the price.
+  (updatedFeedCid, _) <- submit s.aggregator do
+    exerciseCmd s.feedCid UpdateFeed
+
+  Some initialFeed <- queryContractId s.aggregator s.feedCid
+  Some updatedFeed <- queryContractId s.aggregator updatedFeedCid
+
+  -- The contract ID should be the same as the choice is non-consuming
+  updatedFeedCid === s.feedCid
+  -- The price and time should not have changed from the initial state
+  updatedFeed.lastPrice === initialFeed.lastPrice
+  updatedFeed.lastUpdatedAt === initialFeed.lastUpdatedAt
+  debug "Success: testInsufficientSubmissions"
+
+testSubmissionExpiry : Script ()
+testSubmissionExpiry = script do
+  -- Test that submissions older than `submissionTtl` are ignored.
+  debug "Running test: testSubmissionExpiry"
+  s <- setup
+
+  -- P1 and P2 submit prices
+  submit s.p1 do exerciseCmd s.feedCid SubmitPrice with price = 98.0
+  submit s.p2 do exerciseCmd s.feedCid SubmitPrice with price = 99.0
+
+  -- Time passes, making the first two submissions stale
+  passTime (addRelTime submissionTtl (seconds 1))
+
+  -- P3, P4, P5 submit fresh prices
+  submit s.p3 do exerciseCmd s.feedCid SubmitPrice with price = 100.0
+  submit s.p4 do exerciseCmd s.feedCid SubmitPrice with price = 101.0
+  submit s.p5 do exerciseCmd s.feedCid SubmitPrice with price = 102.0
+
+  passTime (seconds 1)
+  updateTime <- getTime
+
+  (updatedFeedCid, _) <- submit s.aggregator do
+    exerciseCmd s.feedCid UpdateFeed
+
+  Some updatedFeed <- queryContractId s.aggregator updatedFeedCid
+  -- The aggregation should only consider the 3 fresh prices [100.0, 101.0, 102.0].
+  -- Trimmed set is empty for 3 elements. Median is 101.0.
+  updatedFeed.lastPrice === Some 101.0
+  updatedFeed.lastUpdatedAt === updateTime
+  debug "Success: testSubmissionExpiry"
+
+testSubscriptionWorkflow : Script ()
+testSubscriptionWorkflow = script do
+  -- Test the full workflow: subscribe, update price, fetch price.
+  debug "Running test: testSubscriptionWorkflow"
+  s <- setup
+
+  -- 1. Subscriber requests a subscription
+  reqCid <- submit s.subscriber do
+    createCmd SubscriptionRequest with
+      subscriber = s.subscriber
+      aggregator = s.aggregator
+      feedPair = ethUsdPair
+
+  -- 2. Aggregator accepts the request
+  (subCid, _) <- submit s.aggregator do
+    exerciseCmd reqCid AcceptRequest with feedCid = s.feedCid
+
+  -- 3. Providers submit prices and aggregator updates the feed
+  submit s.p1 do exerciseCmd s.feedCid SubmitPrice with price = 2000.0
+  submit s.p2 do exerciseCmd s.feedCid SubmitPrice with price = 2001.0
+  submit s.p3 do exerciseCmd s.feedCid SubmitPrice with price = 2002.0
+
+  (updatedFeedCid, _) <- submit s.aggregator do
+    exerciseCmd s.feedCid UpdateFeed
+
+  -- 4. Subscriber fetches the price via their subscription
+  (fetchedPrice, fetchedTime) <- submit s.subscriber do
+    exerciseCmd subCid FetchPrice
+
+  -- 5. Verify the fetched price is correct
+  fetchedPrice === Some 2001.0
+  Some updatedFeed <- queryContractId s.aggregator updatedFeedCid
+  fetchedTime === updatedFeed.lastUpdatedAt
+  debug "Success: testSubscriptionWorkflow"
+
+testUnstakedProvider : Script ()
+testUnstakedProvider = script do
+  -- Test that a provider without a valid stake cannot submit a price.
+  debug "Running test: testUnstakedProvider"
+  s <- setup
+  rogueProvider <- allocatePartyWithHint "RogueProvider" (PartyIdHint "rogue")
+
+  -- The rogue provider has no ProviderStake contract, so this should fail.
+  submitMustFail rogueProvider do
+    exerciseCmd s.feedCid SubmitPrice with price = 999.0
+
+  debug "Success: testUnstakedProvider"
