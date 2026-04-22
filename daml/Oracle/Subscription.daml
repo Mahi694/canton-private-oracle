@@ -1,0 +1,56 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Oracle.Subscription where
+
+import DA.Date (Date, toDateUTC)
+import DA.Time (Time, getTime)
+import Oracle.PrivateFeed (PrivateFeed(..))
+
+-- | Represents a subscription agreement between a `subscriber` (e.g., a dApp) and the oracle `protocol`
+-- | operator. This contract acts as a time-bound access key to a specific `PrivateFeed` contract.
+-- | The existence of this contract proves the subscriber's right to query the feed.
+template Subscription
+  with
+    protocol       : Party
+      -- ^ The operator of the oracle protocol.
+    subscriber     : Party
+      -- ^ The party subscribing to the price feed.
+    privateFeedCid : ContractId PrivateFeed
+      -- ^ The contract ID of the specific private feed being subscribed to.
+    validFrom      : Date
+      -- ^ The start date of the subscription period (inclusive).
+    validUntil     : Date
+      -- ^ The end date of the subscription period (inclusive).
+    subscriptionId : Text
+      -- ^ A unique identifier for this subscription instance.
+  where
+    signatory protocol, subscriber
+
+    key (protocol, subscriber, subscriptionId) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    ensure validFrom <= validUntil
+
+    -- | Allows the subscriber to query the associated private feed for its latest price,
+    -- | provided the subscription is currently active.
+    nonconsuming choice GetLatestPrice : Optional (Time, Decimal)
+      controller subscriber
+      do
+        -- Enforce that the subscription is currently valid.
+        now <- getTime
+        let currentDate = toDateUTC now
+        assertMsg "Subscription is not active" (currentDate >= validFrom && currentDate <= validUntil)
+
+        -- Fetch the private feed contract and return its last reported price.
+        feed <- fetch privateFeedCid
+        return feed.lastPrice
+
+    -- | Allows either party to archive the subscription contract after it has expired.
+    choice ArchiveSubscription : ()
+      controller protocol, subscriber
+      do
+        now <- getTime
+        let currentDate = toDateUTC now
+        assertMsg "Subscription has not expired yet" (currentDate > validUntil)
+        return ()
