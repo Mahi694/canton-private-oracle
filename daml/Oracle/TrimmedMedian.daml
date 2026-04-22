@@ -1,0 +1,178 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Oracle.TrimmedMedian where
+
+import Daml.Script
+import DA.List
+import DA.Optional
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Map (Map)
+import qualified DA.Map as Map
+import DA.Assert
+import DA.Action
+
+import Oracle.ProviderSubmission (Submission)
+
+-- | Configuration for a trimmed median aggregator.
+data Config = Config with
+  aggregator : Party
+    -- ^ The party responsible for running the aggregation logic.
+  oracleOperator : Party
+    -- ^ The party that manages the oracle service, including provider whitelists.
+  minimumSubmissions : Int
+    -- ^ The minimum number of submissions required to compute an aggregation.
+  trimCount : Int
+    -- ^ The number of submissions to trim from BOTH top and bottom of the sorted list.
+    -- ^ e.g., trimCount = 1 means the 1 lowest and 1 highest price are removed.
+  deriving (Eq, Show)
+
+-- | Represents a finalized, aggregated price from the aggregator for a specific round.
+-- | The OracleOperator can observe this and use it to update the `PrivateFeed` for subscribers.
+template AggregatedPrice
+  with
+    asset : Text
+    price : Decimal
+    roundId : Int
+    aggregator : Party
+    oracleOperator : Party
+    submissionsUsed : Int
+    providerPrices : Map Party Decimal
+  where
+    signatory aggregator
+    observer oracleOperator
+
+    -- | The operator can archive this once the price has been propagated to the subscribers.
+    -- | This is a standard pattern for cleaning up "receipt" style contracts.
+    choice AcknowledgeAndArchive : ()
+      controller oracleOperator
+      do return ()
+
+-- | The core aggregator contract. It collects submissions from a set of whitelisted
+-- | providers and computes a trimmed median to produce a robust price feed.
+template TrimmedMedianAggregator
+  with
+    config : Config
+    asset : Text
+    providers : Set Party
+    currentSubmissions : Map Party (ContractId Submission)
+    roundId : Int
+  where
+    signatory config.aggregator
+    observer config.oracleOperator, Set.toList providers
+
+    -- | Helper to ensure a party is an authorized provider for this feed.
+    ensure isProvider p =
+      assertMsg ("Party " <> show p <> " is not an authorized provider for asset " <> asset)
+        (Set.member p providers)
+
+    -- | The oracle operator can add a new data provider to the authorized set.
+    choice AddProvider : ContractId TrimmedMedianAggregator
+      with
+        newProvider : Party
+      controller config.oracleOperator
+      do
+        assertMsg "Provider already exists in the authorized set." (not $ Set.member newProvider providers)
+        create this with providers = Set.insert newProvider providers
+
+    -- | The oracle operator can remove a data provider from the authorized set.
+    choice RemoveProvider : ContractId TrimmedMedianAggregator
+      with
+        providerToRemove : Party
+      controller config.oracleOperator
+      do
+        ensure isProvider providerToRemove
+        -- Also remove any pending submission from this provider to keep state clean.
+        let updatedSubmissions = Map.delete providerToRemove currentSubmissions
+        create this with
+          providers = Set.delete providerToRemove providers
+          currentSubmissions = updatedSubmissions
+
+    -- | The aggregator accepts a new submission from an authorized provider.
+    -- | This would typically be called by a trigger that is watching for `Submission` contracts.
+    choice AcceptSubmission : ContractId TrimmedMedianAggregator
+      with
+        submissionCid : ContractId Submission
+      controller config.aggregator
+      do
+        submission <- fetch submissionCid
+        ensure isProvider submission.provider
+        assertMsg ("Submission is for the wrong asset. Expected " <> asset <> ", got " <> submission.asset)
+          (submission.asset == asset)
+
+        -- If a submission from this provider already exists for the current round, archive it.
+        case Map.lookup submission.provider currentSubmissions of
+          Some oldCid -> archive oldCid
+          None -> return ()
+
+        -- Add the new submission, overwriting the old one if it existed.
+        let updatedSubmissions = Map.insert submission.provider submissionCid currentSubmissions
+        create this with currentSubmissions = updatedSubmissions
+
+    -- | The aggregator's main function: calculate the trimmed median from all current
+    -- | submissions, publish the result, and reset for the next round.
+    choice AggregateAndPublish : ContractId AggregatedPrice
+      controller config.aggregator
+      do
+        let submissionCids = Map.values currentSubmissions
+        assertMsg ("Insufficient submissions to aggregate. Need at least " <> show config.minimumSubmissions <> ", but have " <> show (length submissionCids))
+          (length submissionCids >= config.minimumSubmissions)
+
+        submissions <- mapA fetch submissionCids
+
+        let prices = map (\s -> s.price) submissions
+        let sortedPrices = sort prices
+        let numPrices = length sortedPrices
+
+        -- Ensure we have enough data points to perform the trim operation.
+        let requiredForTrim = 2 * config.trimCount + 1
+        assertMsg ("Not enough submissions to trim. Have " <> show numPrices <> ", but need at least " <> show requiredForTrim)
+          (numPrices >= requiredForTrim)
+
+        -- Trim the lowest and highest values.
+        let trimmedPrices = drop config.trimCount (take (numPrices - config.trimCount) sortedPrices)
+
+        -- Calculate the median of the remaining (trimmed) list.
+        medianPrice <- case medianOfSorted trimmedPrices of
+          Some p -> return p
+          None -> abort "Error calculating median from trimmed price list. This should not happen with a non-empty list."
+
+        -- Archive all submission contracts used in this round.
+        mapA_ archive submissionCids
+
+        -- Create the aggregated price contract for the operator to consume.
+        let providerPrices = Map.fromList (map (\s -> (s.provider, s.price)) submissions)
+        aggregatedPriceCid <- create AggregatedPrice with
+          asset
+          price = medianPrice
+          roundId
+          aggregator = config.aggregator
+          oracleOperator = config.oracleOperator
+          submissionsUsed = numPrices
+          providerPrices
+
+        -- Recreate the aggregator for the next round, incrementing the round ID
+        -- and clearing the submissions map.
+        create this with
+          roundId = roundId + 1
+          currentSubmissions = Map.empty
+
+        return aggregatedPriceCid
+
+-- | Helper function to calculate the median of a *sorted* list of Decimals.
+-- | Returns `None` for an empty list. For an even-length list, it returns the
+-- | arithmetic mean of the two middle elements.
+medianOfSorted : [Decimal] -> Optional Decimal
+medianOfSorted [] = None
+medianOfSorted sortedPrices =
+  let
+    len = length sortedPrices
+    mid = len / 2
+  in
+    if odd len then
+      -- For odd length, the median is the single middle element.
+      Some (sortedPrices !! mid)
+    else
+      -- For even length, the median is the average of the two middle elements.
+      Some (((sortedPrices !! (mid - 1)) + (sortedPrices !! mid)) / 2.0)
