@@ -1,0 +1,136 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module Oracle.ProviderSubmission where
+
+import Daml.Script
+import DA.Time (Time)
+
+-- | Represents an authorized provider's ability to submit prices for a specific feed.
+-- This contract is created by the `aggregator` to onboard a new `provider`.
+-- It serves as a long-lived permission slip for the provider, who exercises
+-- choices on this contract to submit data.
+template ProviderRole
+  with
+    aggregator: Party
+      -- ^ The party operating the oracle aggregation service.
+    provider: Party
+      -- ^ The party authorized to submit price data.
+    feedId: Text
+      -- ^ The unique identifier for the price feed, e.g., "BTC/USD".
+  where
+    signatory aggregator, provider
+
+    key (aggregator, provider, feedId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | Allows the authorized provider to submit a new price observation for the feed.
+    -- This creates a `PriceSubmission` contract, which is a private record of this
+    -- specific submission, visible only to the aggregator and the provider.
+    nonconsuming choice SubmitPrice : ContractId PriceSubmission
+      with
+        price: Decimal
+          -- ^ The price value being submitted.
+        timestamp: Time
+          -- ^ The time at which the price was observed by the provider.
+      controller provider
+      do
+        now <- getTime
+        -- Basic sanity check to prevent submissions with future timestamps.
+        -- More robust validation (e.g., against an aggregation round window)
+        -- can be performed by the aggregator when processing the submission.
+        assertMsg "Submission timestamp cannot be in the future" (timestamp <= now)
+
+        create PriceSubmission with
+          aggregator
+          provider
+          feedId
+          price
+          timestamp
+
+    -- | Allows the aggregator to offboard a provider, revoking their ability to submit prices.
+    choice RemoveProvider : ()
+      controller aggregator
+      do
+        return ()
+
+-- | A private contract representing a single price submission from a provider.
+-- This contract is transient and will be consumed by the aggregator during the
+-- price update process. Its privacy is key: only the aggregator can see the raw
+-- submission, preventing front-running and protecting the provider's data. No
+-- other dApp or party can view this contract.
+template PriceSubmission
+  with
+    aggregator: Party
+      -- ^ The oracle aggregator who will process this submission.
+    provider: Party
+      -- ^ The provider who submitted the price.
+    feedId: Text
+      -- ^ The identifier for the price feed.
+    price: Decimal
+      -- ^ The submitted price.
+    timestamp: Time
+      -- ^ The timestamp of the price observation.
+  where
+    signatory provider
+    observer aggregator
+
+    key (aggregator, provider, feedId, timestamp) : (Party, Party, Text, Time)
+    maintainer key._1
+
+-- | Test script for the provider submission workflow.
+-- This script simulates:
+-- 1. Onboarding a provider by creating a `ProviderRole` contract.
+-- 2. The provider successfully submitting a price.
+-- 3. Verifying that the submission is private and cannot be seen by an uninvolved party.
+-- 4. Offboarding the provider.
+-- 5. Verifying the offboarded provider can no longer submit prices.
+setupProviderSubmission : Script ()
+setupProviderSubmission = script do
+  aggregator <- allocatePartyWithHint "Aggregator" (PartyIdHint "aggregator")
+  provider   <- allocatePartyWithHint "Provider1" (PartyIdHint "provider1")
+  consumer   <- allocatePartyWithHint "ConsumerDApp" (PartyIdHint "consumerdapp")
+
+  let feedId = "BTC/USD"
+
+  -- 1. Aggregator onboards the provider for the BTC/USD feed.
+  providerRoleCid <- submit aggregator do
+    createCmd ProviderRole with
+      aggregator
+      provider
+      feedId
+
+  -- 2. Provider submits a price via their role contract.
+  now <- getTime
+  submissionCid <- submit provider do
+    exerciseCmd providerRoleCid SubmitPrice with
+      price = 65123.456789
+      timestamp = now
+
+  -- Verify the submission contract is visible to the aggregator.
+  submission <- submit aggregator do
+    fetchCmd submissionCid
+  debug $ "Provider submitted price: " <> show submission.price
+  assert (submission.provider == provider)
+
+  -- 3. Verify privacy: the consumer dApp CANNOT see the individual submission.
+  -- This `submitMustFail` block is expected to succeed, demonstrating the privacy model.
+  submitMustFail consumer do
+    fetchCmd submissionCid
+  debug "SUCCESS: Unrelated consumer party cannot see the private price submission."
+
+  -- 4. Aggregator removes the provider's role.
+  submit aggregator do
+    exerciseCmd providerRoleCid RemoveProvider
+
+  -- 5. Verify the removed provider can no longer submit prices.
+  -- This `submitMustFail` block is also expected to succeed.
+  submitMustFail provider do
+    exerciseCmd providerRoleCid SubmitPrice with
+      price = 65125.000000
+      timestamp = now
+  debug "SUCCESS: Removed provider can no longer submit prices."
+
+  return ()
