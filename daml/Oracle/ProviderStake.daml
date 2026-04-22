@@ -1,0 +1,157 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Oracle.ProviderStake where
+
+import Daml.Script
+import DA.Time (Time)
+import DA.Assert ((assertMsg))
+import Daml.Finance.Interface.Asset.Fungible qualified as Fungible (I, AssetId, Split(..), Transfer(..), Merge(..))
+
+-- | Represents a provider's staked assets, acting as a bond for good behavior.
+-- This contract holds the fungible asset and manages its lifecycle, including
+-- slashing for poor performance and unstaking upon retirement.
+template ProviderStake
+  with
+    provider: Party
+      -- ^ The oracle provider who has staked the asset.
+    aggregator: Party
+      -- ^ The oracle network operator who manages the stake.
+    stakeDepository: Party
+      -- ^ The party holding custody of the staked asset. Typically the aggregator.
+    stakeAsset: ContractId Fungible.I
+      -- ^ The contract ID of the fungible asset being staked.
+    stakeAmount: Decimal
+      -- ^ The quantity of the staked asset.
+    stakeAssetId: Fungible.AssetId
+      -- ^ The identifier of the staked asset (e.g., ISIN, CUSIP).
+    slashingPenalty: Decimal
+      -- ^ The fixed amount to be slashed from the stake in case of misbehavior.
+    lastSlashed: Optional Time
+      -- ^ The timestamp of the last slashing event, if any.
+  where
+    signatory provider, aggregator
+    observer stakeDepository
+
+    key (provider, aggregator, stakeAssetId) : (Party, Party, Fungible.AssetId)
+    maintainer key._1
+
+    -- | Choice exercised by the aggregator to penalize a provider for submitting
+    -- inaccurate or malicious data. A portion of the stake is transferred to
+    -- the aggregator.
+    choice Slash : ContractId ProviderStake
+      with
+        reason: Text
+          -- ^ A description of why the provider is being slashed.
+      controller aggregator
+      do
+        -- Ensure the stake is sufficient for the penalty. Providers must top up
+        -- their stake if it falls below the penalty amount.
+        assertMsg "Stake amount is insufficient for slashing penalty" (stakeAmount > slashingPenalty)
+        assertMsg "Slashing penalty must be a positive amount" (slashingPenalty > 0.0)
+
+        -- Split the staked asset contract into the slashed portion and the remainder.
+        (slashedCid, remainingCid) <- exercise stakeAsset Fungible.Split by slashingPenalty
+
+        -- Transfer the slashed portion to the aggregator as the penalty.
+        exercise slashedCid Fungible.Transfer
+          with
+            newOwner = aggregator
+
+        -- Re-create the ProviderStake contract with the reduced amount.
+        time <- getTime
+        create this with
+          stakeAsset = remainingCid
+          stakeAmount = stakeAmount - slashingPenalty
+          lastSlashed = Some time
+
+    -- | Choice exercised by the provider to add more funds to their stake,
+    -- for example, after being slashed or to increase their bond.
+    choice TopUp : ContractId ProviderStake
+      with
+        additionalStakeCid: ContractId Fungible.I
+          -- ^ The fungible asset contract to add to the existing stake.
+      controller provider
+      do
+        -- Verify that the asset being added matches the existing stake asset type.
+        additionalStake <- fetch additionalStakeCid
+        assertMsg "Top-up asset must match the staked asset type" (additionalStake.id == stakeAssetId)
+        assertMsg "Top-up amount must be positive" (additionalStake.quantity > 0.0)
+
+        -- The provider must authorize the merge, as they own the additional stake.
+        -- The depository must also authorize, as they own the existing stake.
+        mergedCid <- exercise stakeAsset Fungible.Merge
+          with
+            controllers = [provider, stakeDepository]
+            otherCid = additionalStakeCid
+
+        -- Re-create the ProviderStake contract with the increased amount.
+        create this with
+          stakeAsset = mergedCid
+          stakeAmount = stakeAmount + additionalStake.quantity
+
+    -- | Choice exercised by the provider to withdraw their entire stake.
+    -- In a production system, this would likely be subject to a cooldown period
+    -- or a check for any active, unfinalized submissions.
+    choice Unstake : ()
+      controller provider
+      do
+        -- Transfer the entire remaining stake back to the provider.
+        -- This archives the stake asset contract under the depository's ownership.
+        exercise stakeAsset Fungible.Transfer
+          with
+            newOwner = provider
+        -- The ProviderStake contract is consumed, ending the staking relationship.
+        return ()
+
+-- | A proposal from a provider to establish a new stake with an aggregator.
+-- This follows the standard two-phase commit pattern where the provider proposes
+-- and the aggregator accepts, creating the `ProviderStake` contract atomically.
+template ProviderStakeProposal
+  with
+    provider: Party
+      -- ^ The oracle provider proposing to stake.
+    aggregator: Party
+      -- ^ The oracle network operator receiving the proposal.
+    stakeDepository: Party
+      -- ^ The designated custodian for the staked asset.
+    stakeToProposeCid: ContractId Fungible.I
+      -- ^ The fungible asset contract the provider intends to stake.
+    stakeAmount: Decimal
+      -- ^ The quantity of the asset to be staked.
+    stakeAssetId: Fungible.AssetId
+      -- ^ The identifier of the asset to be staked.
+    slashingPenalty: Decimal
+      -- ^ The proposed penalty amount for slashing events.
+  where
+    signatory provider
+    observer aggregator
+
+    ensure stakeAmount > 0.0 && slashingPenalty > 0.0
+
+    -- | The aggregator accepts the proposal, transferring the provider's asset
+    -- to the depository and creating the official `ProviderStake` contract.
+    choice Accept : ContractId ProviderStake
+      controller aggregator
+      do
+        -- Atomically transfer ownership of the proposed stake asset from the
+        -- provider to the designated depository.
+        stakedCid <- exercise stakeToProposeCid Fungible.Transfer
+          with
+            newOwner = stakeDepository
+
+        -- Create the active stake contract, which is now bilaterally signed.
+        create ProviderStake with
+          provider
+          aggregator
+          stakeDepository
+          stakeAsset = stakedCid
+          stakeAmount
+          stakeAssetId
+          slashingPenalty
+          lastSlashed = None
+
+    -- | The provider can withdraw their proposal before it is accepted.
+    choice Withdraw : ()
+      controller provider
+      do return ()
