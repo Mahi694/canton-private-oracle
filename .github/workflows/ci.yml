@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  daml-build-and-test:
+    name: Build & Test Oracle Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install DPM (Canton SDK)
+        run: curl https://get.digitalasset.com/install/install.sh | sh
+
+      - name: Add DPM to PATH
+        run: echo "$HOME/.dpm/bin" >> $GITHUB_PATH
+
+      - name: Cache DPM packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.dpm/packages
+          key: ${{ runner.os }}-dpm-v1-${{ hashFiles('**/daml.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-dpm-v1-
+
+      - name: Build Daml Contracts
+        run: dpm build
+
+      - name: Run Daml Aggregation Tests
+        run: dpm test
